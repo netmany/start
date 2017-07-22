@@ -1,0 +1,194 @@
+linux系统广泛应用于服务器端和客户端(如android), 因而大部分程序都是linux应用程序;
+应用程序的生命周期包括: 需求分析, 概要设计, 编码实现, 调试维护. 其中第四阶段的耗时最长, 因而熟悉linux的调试至关重要.
+为何调试和维护?
+程序运行行为不符合预期, 引入新需求产生意想不到的问题;
+意料之外的行为按严重程度分: 异常退出, 卡死无响应, 响应值不对, 无法长时间运行, 响应慢.
+下面对每类行为提出相应的解决方案:
+1) 异常退出: 产生的原因有内存非法地址访问, 权限不足, 内存泄露被杀, 逻辑错误退出;
+解决方法, 即生成crash时的黑盒子coredump(应用进程的内存镜像),然后可从该文件分析崩溃时的线程调用栈和各栈中变量值; 
+权限异常和逻辑错误需要跟踪打印调用返回值;
+2) 卡死无响应: 产生的原因有等待锁,等待系统调用返回, 死循环;
+解决方法: 手动触发coredump分析进程调用栈, strace跟踪系统调用耗时
+3) 响应值不对: 逻辑错误,可printf日志跟踪, dumpstack打印调用栈;
+4)无法长时间运行: printf日志跟踪, 分析coredump, 监控内存泄露;
+5)响应慢: 可printf日志跟踪, dumpstack打印调用栈,strace跟踪系统调用耗时, profile日志分析
+
+下面给出一个示例程序, 包含几种技术(printf, backtrace, coredump, strace, valgrind);
+#include <execinfo.h>  
+#include <stdio.h>  
+#include <stdlib.h>  
+#include <pthread.h>
+
+/* Obtain a backtrace and print it to @code{stdout}. */  
+void print_trace (void)  
+{  
+    void *array[10];  
+    int size;  
+    char **strings;  
+    int i;  
+    size = backtrace(array, 10);  
+    strings = backtrace_symbols(array, size);  
+    if(NULL == strings)  
+    {  
+        perror("backtrace_synbols");  
+        exit(EXIT_FAILURE);  
+    }  
+
+    printf ("Obtained %d stack frames.\n", (size - 1));  
+
+    for (i = 1; i < size; i++)  
+        printf ("%s\n", strings[i]);  
+
+    free (strings);  
+    strings = NULL;  
+} 
+
+void blocked_exp(void){
+    int block_num = 0;
+    void* p = NULL;
+    while(1) {
+        p = malloc(1024);
+        printf("pid=%d, tid=%d, %s/block_num=%d\n", 
+                (int)getpid(), (int)pthread_self(), 
+                __FUNCTION__, block_num);
+        block_num++;
+        sleep(block_num);
+    }
+}
+
+int func(int *p)
+{
+    printf("file[%s:%d]: func[%s]/ p=%p\n",
+            __FILE__, __LINE__, __FUNCTION__, p);
+    print_trace();    
+    
+    blocked_exp();
+    
+    int y = *p;
+    return y;
+}
+int main()
+{
+    int *p = NULL;
+    printf("file[%s:%d](pid=%d tid=%d): func[%s]/ p=%p\n",
+            __FILE__, __LINE__, 
+            (int)getpid(), (int)pthread_self(), 
+            __FUNCTION__, p);
+    return func(p);
+}
+
+编译:
+gcc -g -rdynamic -o app.bin app.c
+
+设置coredump文件大小(KB):
+ulimit -c 102400
+
+测试执行:
+$ ./app.bin 
+file[app.c:56](pid=27594 tid=0): func[main]/ p=(nil)
+file[app.c:44]: func[func]/ p=(nil)
+Obtained 4 stack frames.
+./app.bin(func+0x36) [0x400be4]
+./app.bin(main+0x5a) [0x400c51]
+/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0xf5) [0x7ffa8a1c3ec5]
+./app.bin() [0x4009e9]
+pid=27594, tid=0, blocked_exp/block_num=0
+pid=27594, tid=0, blocked_exp/block_num=1
+pid=27594, tid=0, blocked_exp/block_num=2
+^C
+手动触发coredump:
+kill -6 $pid-app.bin
+加载core文件,查看崩溃或卡死点where,查看源码位置l, 查看局部变量值p;
+gdb app.bin core
+(gdb) where
+#0  0x00007fdc0e9b2ab0 in __nanosleep_nocancel () at ../sysdeps/unix/syscall-template.S:81
+#1  0x00007fdc0e9b2964 in __sleep (seconds=0) at ../sysdeps/unix/sysv/linux/sleep.c:137
+#2  0x0000000000400bac in blocked_exp () at app.c:37
+#3  0x0000000000400be9 in func (p=0x0) at app.c:47
+#4  0x0000000000400c51 in main () at app.c:59
+(gdb) l app.c:37
+32     while(1) {
+33         printf("pid=%d, tid=%d, %s/block_num=%d\n", 
+34                 (int)getpid(), (int)pthread_self(), 
+35                 __FUNCTION__, block_num);
+36         block_num++;
+37         sleep(block_num);
+38     }
+39 }
+40 
+41 int func(int *p)
+(gdb) f 2
+#2  0x0000000000400bac in blocked_exp () at app.c:37
+37         sleep(block_num);
+(gdb) p block_num
+$1 = 4
+(gdb)q
+使用strace跟踪系统调用耗时:
+$ strace -T  -f ./app.bin
+execve("./app.bin", ["./app.bin"], [/* 90 vars */]) = 0 <0.000096>
+brk(0)                                  = 0x1fca000 <0.000005>
+access("/etc/ld.so.nohwcap", F_OK)      = -1 ENOENT (No such file or directory) <0.000013>
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f43f41f5000 <0.000015>
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory) <0.000013>
+open("/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3 <0.000017>
+fstat(3, {st_mode=S_IFREG|0644, st_size=144023, ...}) = 0 <0.000009>
+mmap(NULL, 144023, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f43f41d1000 <0.000010>
+close(3)                                = 0 <0.000008>
+access("/etc/ld.so.nohwcap", F_OK)      = -1 ENOENT (No such file or directory) <0.000009>
+open("/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3 <0.000015>
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320\37\2\0\0\0\0\0"..., 832) = 832 <0.000010>
+fstat(3, {st_mode=S_IFREG|0755, st_size=1845024, ...}) = 0 <0.000009>
+mmap(NULL, 3953344, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f43f3c0f000 <0.000012>
+
+valgrind检查内存泄露:
+$ valgrind ./app.bin 
+==29115== Memcheck, a memory error detector
+==29115== Copyright (C) 2002-2013, and GNU GPL'd, by Julian Seward et al.
+==29115== Using Valgrind-3.10.0.SVN and LibVEX; rerun with -h for copyright info
+==29115== Command: ./app.bin
+==29115== 
+file[app.c:58](pid=29115 tid=0): func[main]/ p=(nil)
+file[app.c:46]: func[func]/ p=(nil)
+Obtained 4 stack frames.
+./app.bin(func+0x36) [0x400c3a]
+./app.bin(main+0x5a) [0x400ca7]
+/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0xf5) [0x4e58ec5]
+./app.bin() [0x400a29]
+pid=29115, tid=0, blocked_exp/block_num=0
+pid=29115, tid=0, blocked_exp/block_num=1
+pid=29115, tid=0, blocked_exp/block_num=2
+pid=29115, tid=0, blocked_exp/block_num=3
+pid=29115, tid=0, blocked_exp/block_num=4
+pid=29115, tid=0, blocked_exp/block_num=5
+pid=29115, tid=0, blocked_exp/block_num=6
+^C==29115== 
+==29115== HEAP SUMMARY:
+==29115==     in use at exit: 7,168 bytes in 7 blocks
+==29115==   total heap usage: 13 allocs, 6 frees, 9,196 bytes allocated
+==29115== 
+==29115== LEAK SUMMARY:
+==29115==    definitely lost: 6,144 bytes in 6 blocks
+==29115==    indirectly lost: 0 bytes in 0 blocks
+==29115==      possibly lost: 0 bytes in 0 blocks
+==29115==    still reachable: 1,024 bytes in 1 blocks
+==29115==         suppressed: 0 bytes in 0 blocks
+==29115== Rerun with --leak-check=full to see details of leaked memory
+==29115== 
+==29115== For counts of detected and suppressed errors, rerun with: -v
+==29115== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+
+在线调试: , 可断点,单步跟踪调试:
+sudo gdb attach $pid
+(gdb) bt
+#0  0x00007ffe04b5fab0 in __nanosleep_nocancel () at ../sysdeps/unix/syscall-template.S:81
+#1  0x00007ffe04b5f964 in __sleep (seconds=0) at ../sysdeps/unix/sysv/linux/sleep.c:137
+#2  0x0000000000400c02 in blocked_exp () at app.c:39
+#3  0x0000000000400c3f in func (p=0x0) at app.c:49
+#4  0x0000000000400ca7 in main () at app.c:61
+(gdb) c
+参考链接:
+1. 定位 UNIX 上常见问题的经验总结
+2. coredump简介与coredump原因总结
+3.  gdb基础命令和常用操作补充
+4. Core Dump调试和多线程调试
+5. 如何使用strace+pstack利器分析程序性能
